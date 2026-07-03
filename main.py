@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uuid
 import time
 import base64
@@ -25,54 +26,67 @@ RATE_LIMIT = 19
 WINDOW = 10
 
 # -----------------------------
-# Fixed catalog (IDs 1..60)
+# Fixed catalog
 # -----------------------------
 catalog = [
-    {
-        "id": i,
-        "item": f"Product {i}"
-    }
+    {"id": i, "item": f"Product {i}"}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
 # -----------------------------
-# Memory stores
+# Stores
 # -----------------------------
 idempotency_store = {}
 client_requests = {}
 
 # -----------------------------
-# Root endpoint (optional)
+# Root
 # -----------------------------
 @app.get("/")
 def root():
     return {"status": "running"}
 
 # -----------------------------
-# Rate limiting helper
+# Rate Limit Middleware
 # -----------------------------
-def check_rate_limit(client_id: str):
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+
+    # Skip OPTIONS (CORS preflight)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    client_id = request.headers.get("X-Client-Id", "default")
+
     now = time.time()
 
     if client_id not in client_requests:
         client_requests[client_id] = []
 
-    # Keep only requests within last 10 seconds
+    # Keep only timestamps within WINDOW seconds
     client_requests[client_id] = [
         t for t in client_requests[client_id]
         if now - t < WINDOW
     ]
 
     if len(client_requests[client_id]) >= RATE_LIMIT:
-        retry_after = int(WINDOW - (now - client_requests[client_id][0])) + 1
 
-        raise HTTPException(
+        retry_after = max(
+            1,
+            int(WINDOW - (now - client_requests[client_id][0])) + 1,
+        )
+
+        return JSONResponse(
             status_code=429,
-            detail="Rate limit exceeded",
-            headers={"Retry-After": str(retry_after)}
+            content={"detail": "Rate limit exceeded"},
+            headers={
+                "Retry-After": str(retry_after)
+            },
         )
 
     client_requests[client_id].append(now)
+
+    return await call_next(request)
 
 # -----------------------------
 # POST /orders
@@ -80,11 +94,8 @@ def check_rate_limit(client_id: str):
 @app.post("/orders", status_code=201)
 def create_order(
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    x_client_id: str = Header(default="default", alias="X-Client-Id"),
 ):
-    check_rate_limit(x_client_id)
 
-    # Same key -> same order
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
 
@@ -100,18 +111,16 @@ def create_order(
 # GET /orders
 # -----------------------------
 @app.get("/orders")
-def list_orders(
+def get_orders(
     limit: int = 10,
     cursor: str | None = None,
-    x_client_id: str = Header(default="default", alias="X-Client-Id"),
 ):
-    check_rate_limit(x_client_id)
 
     start = 0
 
     if cursor:
         try:
-            start = int(base64.b64decode(cursor).decode())
+            start = int(base64.b64decode(cursor.encode()).decode())
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid cursor")
 
@@ -126,5 +135,5 @@ def list_orders(
 
     return {
         "items": items,
-        "next_cursor": next_cursor
+        "next_cursor": next_cursor,
     }
