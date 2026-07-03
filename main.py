@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -40,7 +40,7 @@ catalog = [
 ]
 
 # =====================================================
-# Memory
+# In-memory Stores
 # =====================================================
 
 idempotency_store = {}
@@ -50,18 +50,16 @@ client_requests = {}
 # Rate Limiter
 # =====================================================
 
-def rate_limit(client_id: str):
+def check_rate_limit(client_id: Optional[str]):
+    if client_id is None:
+        return None
 
     now = time.time()
 
     timestamps = client_requests.get(client_id, [])
 
-    # Keep only last 10 seconds
-    timestamps = [
-        t
-        for t in timestamps
-        if now - t < WINDOW
-    ]
+    # Keep only requests in the last 10 seconds
+    timestamps = [t for t in timestamps if now - t < WINDOW]
 
     if len(timestamps) >= RATE_LIMIT:
 
@@ -70,9 +68,11 @@ def rate_limit(client_id: str):
             int(WINDOW - (now - timestamps[0])) + 1
         )
 
-        raise HTTPException(
+        return JSONResponse(
             status_code=429,
-            detail="Rate limit exceeded",
+            content={
+                "detail": "Rate limit exceeded"
+            },
             headers={
                 "Retry-After": str(retry_after)
             }
@@ -81,13 +81,19 @@ def rate_limit(client_id: str):
     timestamps.append(now)
     client_requests[client_id] = timestamps
 
+    return None
+
+
 # =====================================================
 # Home
 # =====================================================
 
 @app.get("/")
 def home():
-    return {"message": "Orders API running"}
+    return {
+        "message": "Orders API running"
+    }
+
 
 # =====================================================
 # Health
@@ -95,7 +101,10 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy"
+    }
+
 
 # =====================================================
 # POST /orders
@@ -104,10 +113,12 @@ def health():
 @app.post("/orders")
 def create_order(
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    x_client_id: str = Header(..., alias="X-Client-Id")
+    x_client_id: Optional[str] = Header(None, alias="X-Client-Id")
 ):
 
-    rate_limit(x_client_id)
+    response = check_rate_limit(x_client_id)
+    if response:
+        return response
 
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
@@ -124,6 +135,7 @@ def create_order(
         content=order
     )
 
+
 # =====================================================
 # GET /orders
 # =====================================================
@@ -135,13 +147,16 @@ def get_orders(
     x_client_id: Optional[str] = Header(None, alias="X-Client-Id")
 ):
 
-    # Only rate-limit if grader sends header
-    if x_client_id:
-        rate_limit(x_client_id)
+    response = check_rate_limit(x_client_id)
+    if response:
+        return response
+
+    if limit < 1:
+        limit = 1
 
     try:
         start = int(cursor) if cursor else 0
-    except:
+    except ValueError:
         start = 0
 
     start = max(0, start)
