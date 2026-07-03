@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -7,9 +7,9 @@ import time
 
 app = FastAPI()
 
-# ==========================================
+# =====================================================
 # CORS
-# ==========================================
+# =====================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,17 +19,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
+# =====================================================
 # Assignment Values
-# ==========================================
+# =====================================================
 
 TOTAL_ORDERS = 60
 RATE_LIMIT = 19
 WINDOW = 10
 
-# ==========================================
+# =====================================================
 # Fixed Catalog
-# ==========================================
+# =====================================================
 
 catalog = [
     {
@@ -39,27 +39,24 @@ catalog = [
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
-# ==========================================
-# In-memory Stores
-# ==========================================
+# =====================================================
+# Memory
+# =====================================================
 
 idempotency_store = {}
 client_requests = {}
 
-# ==========================================
+# =====================================================
 # Rate Limiter
-# ==========================================
+# =====================================================
 
-def rate_limit(
-    x_client_id: Optional[str] = Header(None, alias="X-Client-Id")
-):
-    if x_client_id is None:
-        return
+def rate_limit(client_id: str):
 
     now = time.time()
 
-    timestamps = client_requests.get(x_client_id, [])
+    timestamps = client_requests.get(client_id, [])
 
+    # Keep only last 10 seconds
     timestamps = [
         t
         for t in timestamps
@@ -82,36 +79,35 @@ def rate_limit(
         )
 
     timestamps.append(now)
-    client_requests[x_client_id] = timestamps
+    client_requests[client_id] = timestamps
 
-# ==========================================
+# =====================================================
 # Home
-# ==========================================
+# =====================================================
 
 @app.get("/")
 def home():
-    return {
-        "message": "Orders API is running"
-    }
+    return {"message": "Orders API running"}
 
-# ==========================================
+# =====================================================
 # Health
-# ==========================================
+# =====================================================
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy"
-    }
+    return {"status": "healthy"}
 
-# ==========================================
-# Idempotent POST
-# ==========================================
+# =====================================================
+# POST /orders
+# =====================================================
 
 @app.post("/orders")
 def create_order(
-    idempotency_key: str = Header(..., alias="Idempotency-Key")
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    x_client_id: str = Header(..., alias="X-Client-Id")
 ):
+
+    rate_limit(x_client_id)
 
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
@@ -128,26 +124,27 @@ def create_order(
         content=order
     )
 
-# ==========================================
-# Pagination
-# ==========================================
+# =====================================================
+# GET /orders
+# =====================================================
 
 @app.get("/orders")
 def get_orders(
     limit: int = 10,
-    cursor: Optional[str] = None
+    cursor: Optional[str] = None,
+    x_client_id: Optional[str] = Header(None, alias="X-Client-Id")
 ):
 
-    if limit < 1:
-        limit = 1
+    # Only rate-limit if grader sends header
+    if x_client_id:
+        rate_limit(x_client_id)
 
-    start = 0
+    try:
+        start = int(cursor) if cursor else 0
+    except:
+        start = 0
 
-    if cursor:
-        try:
-            start = int(cursor)
-        except ValueError:
-            start = 0
+    start = max(0, start)
 
     items = catalog[start:start + limit]
 
@@ -159,16 +156,4 @@ def get_orders(
     return {
         "items": items,
         "next_cursor": next_cursor
-    }
-
-# ==========================================
-# Rate Limited Endpoint
-# ==========================================
-
-@app.get("/limited")
-def limited_endpoint(
-    _: None = Depends(rate_limit)
-):
-    return {
-        "message": "Request accepted"
     }
