@@ -4,80 +4,74 @@ from typing import Optional
 import uuid
 import time
 
-# Create the FastAPI app
 app = FastAPI()
 
 # -------------------------
-# CORS: allow the grader page to call your API
+# CORS (so browser grader can call your API)
 # -------------------------
-# If your assignment gives a specific origin, put that instead of "*".
-# Example: allow_origins=["https://your-grader-page.com"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # allow all origins for simplicity
+    allow_origins=["*"],        # or specific origin if given by assignment
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------
-# 1. Fixed catalog of orders 1..60
+# Fixed catalog of orders 1..60
 # -------------------------
-T = 60  # total orders
+T = 60
 orders_catalog = [
     {"id": i, "item": f"Item-{i}", "price": 100 + i}
     for i in range(1, T + 1)
 ]
 
 # -------------------------
-# 2. Idempotency store for POST /orders
+# Idempotency store
 # -------------------------
-# Maps Idempotency-Key -> order dict (so same key returns same order)
 idempotency_store = {}
 
 # -------------------------
-# 3. Rate limiting data
+# Rate limiting data
 # -------------------------
-R = 19              # max requests per 10 seconds per client
+R = 19                 # max requests per 10 seconds per client
 WINDOW_SECONDS = 10
-# Maps client_id -> list of timestamps (seconds) of their recent requests
-client_requests = {}
+client_requests = {}   # client_id -> list[timestamps]
 
 
 def rate_limiter(request: Request):
     """
-    Simple per-client rate limiter:
-    - Looks at X-Client-Id header.
-    - Allows up to R requests in the last 10 seconds.
-    - If exceeded, raises HTTP 429 with Retry-After header.
+    Per-client fixed-window rate limiter:
+    - Identifies client by X-Client-Id.
+    - Allows up to R requests in the last WINDOW_SECONDS.
+    - If exceeded, raises HTTPException 429 with Retry-After header.
     """
     client_id = request.headers.get("X-Client-Id")
     if not client_id:
-        # Grader expects per-client limiting, so require the header
+        # Grader relies on per-client buckets, so we require the header.
         raise HTTPException(status_code=400, detail="X-Client-Id header is required")
 
     now = time.time()
-
-    # Get existing timestamps for this client, or empty list
     history = client_requests.get(client_id, [])
 
-    # Keep only timestamps within the last WINDOW_SECONDS
+    # keep only timestamps within the last WINDOW_SECONDS seconds
     recent = [ts for ts in history if now - ts <= WINDOW_SECONDS]
 
-    # If already at or above limit, block this request
+    # if already at or above limit, this request should be blocked
     if len(recent) >= R:
         client_requests[client_id] = recent  # save pruned list
 
-        retry_after_seconds = WINDOW_SECONDS  # tell them to wait 10 seconds
+        retry_after_seconds = WINDOW_SECONDS  # simple choice: ask them to wait 10 seconds
 
-        # IMPORTANT: include Retry-After header so grader is happy
+        # IMPORTANT: headers must be a mapping of str->str
+        # FastAPI will put this into the actual HTTP response headers.
         raise HTTPException(
             status_code=429,
             detail="Too many requests",
             headers={"Retry-After": str(retry_after_seconds)},
         )
 
-    # Otherwise, allow: record this request time
+    # allowed: record this request timestamp
     recent.append(now)
     client_requests[client_id] = recent
 
@@ -89,36 +83,29 @@ def rate_limiter(request: Request):
 def create_order(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     body: dict = Body(default={}),
-    _rate = Depends(rate_limiter),  # enforce rate limiting on this endpoint
+    _rate = Depends(rate_limiter),
 ):
     """
     Idempotent order creation:
-    - First time with a new Idempotency-Key: create a new order, return 201.
-    - Next times with same Idempotency-Key: return the SAME order, no duplicate.
+    - First time with a new Idempotency-Key: create order, return 201.
+    - Repeated calls with the same Idempotency-Key: return the SAME order.
     """
-
-    # Require the Idempotency-Key header
     if idempotency_key is None:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
 
     # If we have already seen this key, return the stored order
     if idempotency_key in idempotency_store:
-        # Return same order as before
         return idempotency_store[idempotency_key]
 
-    # First time with this key: create a new order
-    new_order_id = str(uuid.uuid4())  # unique ID; grader just checks consistency
-
+    # First time: create a new order
+    new_order_id = str(uuid.uuid4())
     order = {
         "id": new_order_id,
         "status": "created",
-        "payload": body,  # optional, just echoes request body
+        "payload": body,
     }
 
-    # Save under this idempotency key
     idempotency_store[idempotency_key] = order
-
-    # Return it (FastAPI will send 201 because of status_code=201 above)
     return order
 
 
@@ -127,19 +114,18 @@ def create_order(
 # -------------------------
 @app.get("/orders")
 def list_orders(
-    limit: int = Query(10, gt=0),         # page size (must be > 0)
-    cursor: Optional[str] = Query(None),  # opaque cursor from previous response
-    _rate = Depends(rate_limiter),        # enforce rate limiting here too
+    limit: int = Query(10, gt=0),
+    cursor: Optional[str] = Query(None),
+    _rate = Depends(rate_limiter),
 ):
     """
-    Cursor pagination over the fixed catalog 1..60:
+    Cursor pagination:
     - GET /orders?limit=P&cursor=C
-    - Returns up to P items from the catalog, starting after 'cursor'.
+    - Returns up to P items from IDs 1..T.
+    - 'cursor' is treated as "last id seen" encoded as a string.
     - Response: {"items": [...], "next_cursor": "..."}
-    - Cursor is "last id seen" encoded as a string (opaque to grader).
     """
-
-    # Interpret cursor as "last_id_seen"
+    # convert cursor string to int last_id_seen
     if cursor is None or cursor == "":
         last_id_seen = 0
     else:
@@ -148,23 +134,18 @@ def list_orders(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid cursor")
 
-    # Next page starts from id = last_id_seen + 1
     start_id = last_id_seen + 1
 
-    # Select orders with id >= start_id, then cut to 'limit' items
+    # Pick items with id >= start_id, then slice to 'limit'
     items = [o for o in orders_catalog if o["id"] >= start_id][:limit]
 
-    # If no items left, we reached the end
     if not items:
         return {
             "items": [],
             "next_cursor": None,
         }
 
-    # New cursor is the last id we returned
     new_last_id = items[-1]["id"]
-
-    # If we haven't finished all 1..T, return the new cursor; else None
     next_cursor = str(new_last_id) if new_last_id < T else None
 
     return {
